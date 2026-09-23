@@ -746,3 +746,101 @@ class TestTenantExtraction:
         server_context = call_args[0][1]
         assert isinstance(server_context, ServerCallContext)
         assert server_context.tenant == ''
+
+
+@pytest.mark.asyncio
+async def test_unhandled_exception_is_sanitized(
+    grpc_handler: GrpcHandler,
+    mock_request_handler: AsyncMock,
+    mock_grpc_context: AsyncMock,
+) -> None:
+    """A non-A2A exception must not leak its message to the client."""
+    mock_request_handler.on_get_task.side_effect = RuntimeError(
+        'internal detail: /secret/path'
+    )
+    request_proto = a2a_pb2.GetTaskRequest(id='any')
+
+    await grpc_handler.GetTask(request_proto, mock_grpc_context)
+
+    mock_grpc_context.abort.assert_awaited_once()
+    call_args, _ = mock_grpc_context.abort.call_args
+    assert call_args[0] == grpc.StatusCode.INTERNAL
+    assert 'internal detail' not in call_args[1]
+    assert 'INTERNAL' in call_args[1] or 'Internal error' in call_args[1]
+
+
+@pytest.mark.asyncio
+async def test_unknown_a2a_error_type_is_sanitized(
+    grpc_handler: GrpcHandler,
+    mock_request_handler: AsyncMock,
+    mock_grpc_context: AsyncMock,
+) -> None:
+    """An A2AError outside the mapping must not leak details."""
+    from a2a.utils.errors import A2AError
+
+    class CustomError(A2AError):
+        message = 'custom'
+
+    mock_request_handler.on_get_task.side_effect = CustomError(
+        'sensitive internals here'
+    )
+    request_proto = a2a_pb2.GetTaskRequest(id='any')
+
+    await grpc_handler.GetTask(request_proto, mock_grpc_context)
+
+    mock_grpc_context.abort.assert_awaited_once()
+    call_args, _ = mock_grpc_context.abort.call_args
+    assert call_args[0] == grpc.StatusCode.UNKNOWN
+    assert 'sensitive internals' not in call_args[1]
+
+
+@pytest.mark.asyncio
+async def test_abort_context_carries_error_data_as_error_info_metadata(
+    grpc_handler: GrpcHandler,
+    mock_request_handler: AsyncMock,
+    mock_grpc_context: AsyncMock,
+) -> None:
+    """``error.data`` must cross gRPC as ``ErrorInfo.metadata``.
+
+    The JSON-RPC and REST paths surface ``error.data`` this way, so a
+    gRPC client that reads ``ErrorInfo`` back would otherwise see the
+    reason code but silently lose the attached data.
+    """
+    error = types.TaskNotFoundError(
+        'Could not find the task', data={'taskId': 'abc-123'}
+    )
+    mock_request_handler.on_get_task.side_effect = error
+    request_proto = a2a_pb2.GetTaskRequest(id='abc-123')
+    await grpc_handler.GetTask(request_proto, mock_grpc_context)
+
+    metadata = mock_grpc_context.set_trailing_metadata.call_args[0][0]
+    bin_values = [v for k, v in metadata if k == 'grpc-status-details-bin']
+
+    status = status_pb2.Status.FromString(bin_values[0])
+    error_info = error_details_pb2.ErrorInfo()
+    status.details[0].Unpack(error_info)
+
+    assert dict(error_info.metadata) == {'taskId': 'abc-123'}
+
+
+@pytest.mark.asyncio
+async def test_abort_context_without_data_has_empty_metadata(
+    grpc_handler: GrpcHandler,
+    mock_request_handler: AsyncMock,
+    mock_grpc_context: AsyncMock,
+) -> None:
+    """An error with no ``data`` must not invent metadata entries."""
+    error = types.TaskNotFoundError('Could not find the task')
+    mock_request_handler.on_get_task.side_effect = error
+    await grpc_handler.GetTask(
+        a2a_pb2.GetTaskRequest(id='1'), mock_grpc_context
+    )
+
+    metadata = mock_grpc_context.set_trailing_metadata.call_args[0][0]
+    bin_values = [v for k, v in metadata if k == 'grpc-status-details-bin']
+
+    status = status_pb2.Status.FromString(bin_values[0])
+    error_info = error_details_pb2.ErrorInfo()
+    status.details[0].Unpack(error_info)
+
+    assert dict(error_info.metadata) == {}

@@ -39,6 +39,27 @@ from a2a.utils.proto_utils import validation_errors_to_bad_request
 logger = logging.getLogger(__name__)
 
 
+def _error_metadata(error: A2AError) -> dict[str, str]:
+    """Project ``A2AError.data`` onto ``ErrorInfo.metadata``.
+
+    ``google.rpc.ErrorInfo.metadata`` is a ``map<string, string>``, so
+    only string-valued entries can cross the wire. The JSON-RPC and REST
+    paths carry ``error.data`` the same way, which keeps the gRPC path
+    from silently dropping it for non-validation errors.
+
+    Returns:
+        The metadata entries to attach, or an empty mapping.
+    """
+    data = getattr(error, 'data', None)
+    if not isinstance(data, dict):
+        return {}
+    return {
+        str(key): str(value)
+        for key, value in data.items()
+        if isinstance(value, str)
+    }
+
+
 class GrpcServerCallContextBuilder(ABC):
     """Interface for building ServerCallContext from gRPC context."""
 
@@ -136,6 +157,9 @@ class GrpcHandler(a2a_grpc.A2AServiceServicer):
             result = await handler_func(server_context)
         except A2AError as e:
             await self.abort_context(e, context)
+        except Exception:
+            logger.exception('Unhandled exception in gRPC handler')
+            await self.abort_context(types.InternalError(), context)
         else:
             return result
         return default_response
@@ -153,6 +177,9 @@ class GrpcHandler(a2a_grpc.A2AServiceServicer):
                 yield item
         except A2AError as e:
             await self.abort_context(e, context)
+        except Exception:
+            logger.exception('Unhandled exception in gRPC handler')
+            await self.abort_context(types.InternalError(), context)
 
     async def SendMessage(
         self,
@@ -374,6 +401,7 @@ class GrpcHandler(a2a_grpc.A2AServiceServicer):
             error_info = error_details_pb2.ErrorInfo(
                 reason=reason,
                 domain='a2a-protocol.org',
+                metadata=_error_metadata(error),
             )
 
             status_code = code.value[0]
@@ -413,9 +441,13 @@ class GrpcHandler(a2a_grpc.A2AServiceServicer):
             context.set_trailing_metadata(tuple(new_metadata))
             await context.abort(rich_status.code, rich_status.details)
         else:
+            logger.error(
+                'Unknown error type during request handling',
+                exc_info=error,
+            )
             await context.abort(
                 grpc.StatusCode.UNKNOWN,
-                f'Unknown error type: {error}',
+                'Unknown error',
             )
 
     def _build_call_context(
